@@ -4,6 +4,8 @@ This gem allows you to use the affinity propagation algorithm (see BJ Frey and D
 [Science 315, Feb 16, 2007](http://www.psi.toronto.edu/affinitypropagation/FreyDueckScience07.pdf)) to cluster arbitrary
 data by providing the data and a block to calculate the similarity between any two data points in that list.
 
+For more information on affinity propagation, visit the [FAQ over at University of Toronto](http://www.psi.toronto.edu/affinitypropagation/faq.html).
+
 ## Installation
 
 Add this line to your application's Gemfile:
