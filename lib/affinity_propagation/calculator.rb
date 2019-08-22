@@ -1,29 +1,8 @@
 require 'matrix'
+require 'concurrent'
+require 'thread'
 
 module AffinityPropagation
-  refine Array do
-    def median
-      relevant_elements = if size % 2 == 0
-        # Even number of items in this list => let's get the middle two and return their mean
-        slice(size / 2, 2)
-      else
-        slice(size / 2, 1)
-      end
-
-      relevant_elements.sum / relevant_elements.size
-    end
-  end
-
-  refine Matrix do
-    def to_matlab
-      output = row_vectors.map(&:to_a).map { |row| row.join(', ') }.join('; ')
-
-      "[#{output}]"
-    end
-
-    public :[]=
-  end
-
   class Calculator
     using AffinityPropagation
 
@@ -81,25 +60,39 @@ module AffinityPropagation
 
     private
 
+    def median(array)
+      relevant_elements = if array.size % 2 == 0
+          # Even number of items in this list => let's get the middle two and return their mean
+          array.sort.slice(array.size / 2, 2)
+        else
+          array.sort.slice(array.size / 2, 1)
+        end
+
+      relevant_elements.sum / relevant_elements.size
+    end
+
     def similarity_matrix(&block)
       similarity_array = []
-      similarities = Matrix.zero(@data.size, @data.size)
+      similarities_future = Matrix.build(@data.size, @data.size) do |row_idx, col_idx|
+        exemplar = @data[row_idx]
+        datum = @data[col_idx]
 
-      @data.size.times do |row_idx|
-        @data.size.times do |col_idx|
-          exemplar = @data[row_idx]
-          datum = @data[col_idx]
+        similarity_future = Concurrent::Future.execute(executor: :fast) { block.call(datum, exemplar)}
+        similarity_array << similarity_future
 
-          similarity = block.call(datum, exemplar)
-          similarity_array << similarity
-
-          similarities[row_idx, col_idx] = similarity
-        end
+        similarity_future
       end
 
-      median_similarity = similarity_array.median
+      while similarity_array.any?(&:pending?)
+        sleep 0.1
+      end
 
-      (0...@data.size).each { |idx| similarities[idx, idx] = median_similarity }
+      similarity_array.map!(&:value)
+      similarities = similarities_future.map(&:value)
+
+      median_similarity = median(similarity_array)
+
+      (0...@data.size).each { |idx| similarities.send(:[]=, idx, idx, median_similarity) }
 
       similarities
     end
@@ -109,44 +102,58 @@ module AffinityPropagation
     end
 
     def responsibility_matrix
-      responsibilities = Matrix.zero(@similarities.row_count, @similarities.column_count)
+      responsibility_futures = []
 
-      @similarities.row_count.times do |row_idx|
-        @similarities.column_count.times do |col_idx|
-          exemplar_idx = row_idx
-          datum_idx = col_idx
+      responsibilities_future = Matrix.build(@similarities.row_count, @similarities.column_count) do |row_idx, col_idx|
+        exemplar_idx = row_idx
+        datum_idx = col_idx
 
-          availability_column = @availabilities.column(col_idx).to_a
+        current_similarity = @similarities[row_idx, col_idx]
+        current_responsibility = @responsibilities[exemplar_idx, datum_idx]
+
+        availability_column = @availabilities.column(col_idx).to_a
+        similarity_column = @similarities.column(col_idx).to_a
+
+        responsibility_future = Concurrent::Future.execute(executor: :fast) do
           availability_column.slice!(exemplar_idx)
-          similarity_column = @similarities.column(col_idx).to_a
           similarity_column.slice!(exemplar_idx)
 
           availability_plus_similarity = []
           availability_column.zip(similarity_column) { |data| availability_plus_similarity << data.sum }
 
-          responsibilities[row_idx, col_idx] = dampen(@similarities[row_idx, col_idx] - availability_plus_similarity.max, @responsibilities[exemplar_idx, datum_idx])
+          dampen(current_similarity - availability_plus_similarity.max, current_responsibility)
         end
+
+        responsibility_futures << responsibility_future
+        responsibility_future
       end
 
-      responsibilities
+      while responsibility_futures.any?(&:pending?)
+        sleep 0.1
+      end
+
+      responsibilities_future.map(&:value)
     end
 
     def availability_matrix
-      availabilities = Matrix.zero(@responsibilities.row_count, @responsibilities.column_count)
+      availability_futures = []
 
-      @responsibilities.row_count.times do |row_idx|
-        @responsibilities.column_count.times do |col_idx|
-          exemplar_idx = row_idx
-          datum_idx = col_idx
-          responsibility_column = @responsibilities.row(exemplar_idx).to_a
+      availabilities_future = Matrix.build(@responsibilities.row_count, @responsibilities.column_count) do |row_idx, col_idx|
+        exemplar_idx = row_idx
+        datum_idx = col_idx
+        responsibility_column = @responsibilities.row(exemplar_idx).to_a
 
+        current_availability = @availabilities[exemplar_idx, datum_idx]
+        current_responsibility = @responsibilities[exemplar_idx, exemplar_idx]
+
+        availability_future = Concurrent::Future.execute(executor: :fast) do
           if exemplar_idx == datum_idx
             # self-availability
             responsibility_column.slice!(exemplar_idx)
 
-            dampen(responsibility_column.inject(0) { |sum, item| sum += [0, item].max },@availabilities[exemplar_idx, datum_idx])
+            dampen(responsibility_column.inject(0) { |sum, item| sum += [0, item].max }, current_availability)
           else
-            self_responsibility = @responsibilities[exemplar_idx, exemplar_idx]
+            self_responsibility = current_responsibility
             if datum_idx > exemplar_idx
               # Slice out the datum index first since in this case it won't affect the exemplar index
               responsibility_column.slice!(datum_idx)
@@ -158,12 +165,19 @@ module AffinityPropagation
 
             responsibility_column_sum = responsibility_column.inject(0) { |sum, item| sum += [0, item].max }
 
-            availabilities[row_idx, col_idx] = dampen([0, self_responsibility + responsibility_column_sum].min, @availabilities[exemplar_idx, datum_idx])
+            dampen([0, self_responsibility + responsibility_column_sum].min, current_availability)
           end
         end
+
+        availability_futures << availability_future
+        availability_future
       end
 
-      availabilities
+      while availability_futures.any?(&:pending?)
+        sleep 0.1
+      end
+
+      availabilities_future.map(&:value)
     end
 
     def identify_raw_clusters
