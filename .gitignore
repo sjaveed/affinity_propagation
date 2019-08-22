@@ -52,3 +52,4 @@ Gemfile.lock
 # IDEs
 .idea
 
+.byebug_history
